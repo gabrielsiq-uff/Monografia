@@ -1,0 +1,873 @@
+import os
+import re
+import time
+import gc
+import logging
+from collections import Counter
+from itertools import combinations
+import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
+
+
+
+# Configurar logging cedo para capturar mensagens de carregamento
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+
+# Dependências opcionais (tratadas em try/except)
+try:
+    import spacy
+except Exception:
+    spacy = None
+    logging.warning("spaCy não disponível no ambiente (import falhou).")
+
+try:
+    import stanza
+except Exception:
+    stanza = None
+    logging.warning("Stanza não disponível no ambiente (import falhou).")
+
+try:
+    import torch
+except Exception:
+    torch = None
+    logging.info("Torch não instalado; operações CUDA serão ignoradas.")
+
+import pandas as pd
+import unidecode
+
+
+# ====================== Config ======================
+INPUT_PATH = 'analise_noticias_2022_sample1000.xlsx'
+OUTPUT_PATH = 'analise_tester_tom_politico.xlsx'
+TEXT_COLUMN = 'Texto Limpo'
+POLITICIAN_COL = 'Político'
+BATCH_SIZE = 300
+
+# ====================== Carregamento spaCy ======================
+SPACY_MODEL = 'pt_core_news_lg'  # ou 'pt_core_news_md'
+nlp = None
+if spacy is not None:
+    try:
+        nlp = spacy.load(SPACY_MODEL)
+        logging.info(f"spaCy carregado: {SPACY_MODEL}")
+    except Exception as e:
+        nlp = None
+        logging.warning(f"Não foi possível carregar spaCy ({SPACY_MODEL}): {e}")
+
+# ====================== Carregamento Stanza ======================
+stanza_nlp = None
+if stanza is not None:
+    try:
+        stanza.download('pt', verbose=False)  # tenta garantir recursos; se já estiver ok, ignora
+    except Exception:
+        # pode falhar se não houver internet/recursos; deixamos seguir
+        pass
+    try:
+        stanza_nlp = stanza.Pipeline('pt', processors='tokenize,pos,lemma', use_gpu=True, verbose=False)
+        logging.info("Stanza pipeline carregada com sucesso (pt).")
+    except Exception as e:
+        stanza_nlp = None
+        logging.warning(f"Stanza falhou ao inicializar: {e}")
+
+# ====================== Stopwords ======================
+try:
+    from nltk.corpus import stopwords
+    stopwords_pt = set(w.lower() for w in stopwords.words('portuguese'))
+except Exception:
+    # conjunto mínimo como fallback
+    stopwords_pt = {"e", "o", "a", "de", "do", "da", "em", "um", "uma", "os", "as", "para", "por", "com", "que"}
+    logging.warning("Não foi possível carregar NLTK stopwords; usando conjunto mínimo interno.")
+
+# ====================== Utilitários ======================
+def normalize(text):
+    return unidecode.unidecode(str(text)).lower().strip()
+
+url_reg = re.compile(r'https?://|www\.|\.com|\.br', flags=re.I)
+emoji_reg = re.compile(
+    "[" 
+    "\U0001F600-\U0001F64F" 
+    "\U0001F300-\U0001F5FF" 
+    "\U0001F680-\U0001F6FF" 
+    "\U0001F1E0-\U0001F1FF" 
+    "]+", flags=re.UNICODE
+)
+
+def contains_url(text):
+    return bool(url_reg.search(text or ""))
+
+def contains_quotes(text):
+    if not text:
+        return False
+    return ('"' in text) or ("“" in text) or ("”" in text) or ("'" in text)
+
+def contains_hashtag_sarcasm(text):
+    t = (text or "").lower()
+    return any(h in t for h in ['#sqn', '#ironia', '#mentira', '#brincadeira', '#not'])
+
+def contains_meme_markers(text):
+    """
+    Detecta marcadores claros de humor digital (risadas, emojis explícitos, hashtags de sarcasmo).
+    Evita falsos positivos por símbolos, bullets, pontuação ou hífens.
+    """
+    if not text:
+        return False
+
+    t = text.lower()
+
+    # risadas explícitas
+    if re.search(r'\b(k{2,}|rs{2,}|haha+|heueh+|hueh+|kkk+)\b', t):
+        return True
+
+    # emojis gráficos reais (rostos, gestos, objetos)
+    emoji_pattern = re.compile(
+        "[" 
+        "\U0001F600-\U0001F64F"  # emoticons
+        "\U0001F910-\U0001F9FF"  # faces e gestos
+        "\U0001F300-\U0001F5FF"  # símbolos & pictogramas
+        "\U0001F680-\U0001F6FF"  # transporte
+        "]+", flags=re.UNICODE
+    )
+    if emoji_pattern.search(text):
+        return True
+
+    # evitar falsos positivos: traços, bullets, aspas, símbolos gráficos
+    if re.search(r'[\u2010-\u2015\u2022\u25A0-\u25FF]', text):
+        return False
+
+    return False
+
+
+def uppercase_density(text):
+    text = str(text or "")
+    words = re.findall(r'\w+', text)
+    if not words:
+        return 0.0
+    count_upperword = 0
+    for w in words:
+        alpha_count = sum(1 for c in w if c.isalpha())
+        if alpha_count == 0:
+            continue
+        upper_count = sum(1 for c in w if c.isupper())
+        ratio = upper_count / alpha_count
+        if ratio > 0.6:
+            count_upperword += 1
+    return count_upperword / len(words)
+
+def exclamation_count(text):
+    return (text or "").count('!')
+
+def simple_tokenize_and_filter(text):
+    tokens = re.findall(r'\b[^\d\W_]+\b', str(text), flags=re.UNICODE)
+    tokens = [t.lower() for t in tokens if t.lower() not in stopwords_pt and len(t) > 1]
+    return tokens
+
+def keyword_in_text(text, keywords_set):
+    if not text:
+        return False
+    text_norm = normalize(text)
+    for kw in keywords_set:
+        if normalize(kw) in text_norm:
+            return True
+    return False
+
+# ============== Categorias e sinais ==============
+CATEGORIES_KEYWORDS = {
+    "Jornalístico": {
+        "keywords": {
+            # --- Marcadores de atribuição de fala / fonte ---
+            "afirma", "afirmou", "disse", "declarou", "relatou", "ressaltou", "segundo", "conforme",
+            "de acordo com", "explicou", "informou", "contou", "comentou", "garantiu", "admitiu",
+            "alegou", "apontou", "destacou", "revelou", "enfatizou", "mencionou",
+            "confirmou", "negou", "assegurou", "ponderou", "concluiu", "afirmando", "reafirmou",
+            "anunciou", "comunicou", "reportou", "indicou", "observou", "descreveu", "expôs",
+            "segundo ele", "segundo ela", "segundo o ministro", "segundo especialistas",
+            "disse que", "afirmou que", "declarou que", "informou que", "comentou que",
+
+            # --- Verbos de ação jornalística ---
+            "investiga", "apurou", "noticiou", "publicou", "divulgou", "repercutiu",
+            "transmitiu", "relata", "veiculou",
+
+            # --- Estrutura textual ---
+            "manchete", "subtítulo", "título", "linha fina", "lead", "reportagem",
+            "matéria", "notícia", "artigo", "editorial", "coluna", "nota", "entrevista",
+            "edição", "pauta", "fonte", "repórter", "jornalista", "agência de notícias",
+            "boletim", "jornal", "revista", "portal", "site", "mídia", "editor", "apresentador",
+
+            # --- Marcadores de objetividade ---
+            "informações indicam", "dados apontam", "conforme apuração", "de acordo com fontes",
+            "os números mostram", "até o momento", "foi divulgado", "foi confirmado",
+            "é o que indica", "segundo informações oficiais",
+
+            # --- Verbos de neutralidade narrativa ---
+            "ocorreu", "aconteceu", "resultou", "causou", "envolveu", "houve", "começou", "encerrou",
+            "prosseguiu", "seguiu", "foi realizado", "acontecerá",
+
+            # --- Atualização e novidade ---
+            "últimas informações", "atualização", "novos dados", "mudança", "anúncio",
+            "revelação", "nota oficial", "comunicado oficial", "nova pesquisa", "última hora",
+
+            # --- Termos do campo jornalístico ---
+            "cobertura jornalística", "mídia digital", "portal de notícias", "conteúdo jornalístico",
+            "edição especial", "editor-chefe", "colunista", "repórter especial",
+            "entrevista exclusiva", "reportagem especial", "edição extraordinária",
+
+            # --- Citação / reprodução textual ---
+            "abre aspas", "fecha aspas", "entre aspas", "em suas palavras", "nas palavras de",
+            "disse ainda", "acrescentou", "completou", "finalizou", "comentou ainda",
+
+            # --- Credibilidade institucional ---
+            "segundo o governo", "segundo o ministério", "segundo o instituto", "segundo o ibge",
+            "segundo o datafolha", "segundo o ibope", "segundo a onu", "segundo a oms",
+            "dados oficiais", "pesquisa divulgada", "informações oficiais", "relatório aponta",
+            "estudo mostra"
+        },
+        "signals": ["quotes", "url", "format_news_like"]
+    },
+
+    "Humorístico/Irônico": {
+        "keywords": {
+            # --- Humor e ironia ---
+            "brincadeira", "piada", "sátira", "ironia", "sarcasmo", "trocadilho", "humor",
+            "zombaria", "deboche", "engraçado", "hilário", "divertido", "gozação",
+            "brincou", "ironizou", "satirizou", "zoou", "caçoou", "tirou sarro",
+            "ironizando", "brincando", "rindo", "zoando", "debochando", "irônico",
+            "sarcástico", "sarcasticamente", "ironicamente",
+
+            # --- Expressões ---
+            "gerou memes", "viralizou", "foi motivo de piada", "repercutiu com humor",
+            "fez graça de", "brincou com a situação", "respondeu com sarcasmo",
+
+            # --- Ironia contextual ---
+            "quem nunca", "só que não", "pra variar", "que surpresa", "tudo normal",
+            "claro, claro", "quem diria", "ótimo serviço", "até parece", "fala sério",
+            "só pode ser piada", "parece comédia", "de rir pra não chorar",
+
+            # --- Humor digital ---
+            "meme", "memes", "zoeira", "lacrou", "cancelado", "tretou", "cringe",
+            "flopou", "internet reagiu", "piadas nas redes", "viral cômico",
+            "respondeu com meme", "comentou com deboche", "reagiu ironicamente"
+        },
+        "signals": ["emoji", "kkk", "hashtagsarcasmo", "meme_markers"]
+    },
+
+    
+    "Avaliativo/Comparativo": {
+        "keywords": {
+            # --- Humor e ironia --- # --- Avaliações positivas implícitas ---
+        "eficiente", "eficaz", "competente", "responsável", "transparente", "estável",
+        "coerente", "sólido", "consistente", "positivo", "favorável", "adequado",
+        "prudente", "assertivo", "exemplar", "notável", "sustentável", "relevante",
+
+        # --- Avaliações negativas implícitas ---
+        "ineficiente", "ineficaz", "incompetente", "irresponsável", "instável",
+        "incoerente", "frágil", "precário", "negativo", "desfavorável", "imprudente",
+        "desastroso", "inadequado", "alarmante", "problemático", "polêmico", "questionável",
+
+        # --- Comparativos / tendências neutras ---
+        "melhor", "pior", "mais", "menos", "maior", "menor", "superior", "inferior",
+        "aumenta", "reduz", "cresce", "diminui", "avança", "recuo", "progresso", "retrocesso",
+
+        # --- Avaliação sem emoção explícita (julgamento técnico) ---
+        "significativo", "moderado", "gradual", "acentuado", "contínuo",
+        "relevante", "expressivo", "limitado", "controlado", "crítico", "estratégico",
+        "controverso", "discutível", "aceitável", "insuficiente", "adequado"
+    },
+    "signals": ["neutral_comparison", "trend_terms", "evaluation_without_emotion"]
+},
+
+
+    "Positivo": {
+        "keywords": {
+        # --- Núcleo semântico: Sucesso e Vitória ---
+        "vitória", "triunfo", "sucesso", "conquista", "avanço", "progresso",
+        "crescimento", "melhoria", "melhorou", "fortalecimento", "expansão",
+        "recorde", "superação", "evolução", "ascensão", "recuperação", "renovação",
+        "consolidar", "garantir", "atingir", "alcançar", "cumprir", "realizar", "concretizar",
+
+        # --- Verbos de ação positiva / acionalidade construtiva ---
+        "aprovar", "apoiar", "promover", "estimular", "investir", "fortalecer",
+        "melhorar", "reduzir", "aliviar", "impulsionar", "gerar", "inspirar",
+        "avançar", "beneficiar", "otimizar", "valorizar", "resgatar", "proteger",
+        "pacificar", "unir", "defender", "preservar", "restaurar", "elevar",
+        "reconstruir", "modernizar", "conquistar", "atingir", "garantir", "implementar",
+
+        # --- Adjetivos de valência positiva (Fairclough: significado identificacional) ---
+        "forte", "honesto", "íntegro", "corajoso", "competente", "eficiente",
+        "responsável", "justo", "exemplar", "comprometido", "visionário", "prudente",
+        "solidário", "respeitado", "admirado", "popular", "humano", "simpático",
+        "tranquilo", "ponderado", "equilibrado", "moderado", "inovador", "habilidoso",
+        "honrado", "sincero", "dedicado", "persistente", "trabalhador", "patriótico",
+        "ético", "coerente", "generoso", "carismático", "eficaz", "competente",
+        "organizado", "capaz", "exemplar",
+
+        # --- Substantivos e conceitos de legitimação institucional ---
+        "reconhecimento", "mérito", "liderança", "confiança", "apoio", "aprovação",
+        "credibilidade", "respeito", "popularidade", "admiração", "esperança",
+        "orgulho", "inspiração", "destaque", "referência", "modelo", "suporte",
+        "união", "paz", "harmonia", "cooperação", "aliança", "acordo", "consenso",
+        "estabilidade", "ordem", "vitória eleitoral", "avanço social", "melhoria econômica",
+
+        # --- Marcadores morais e religiosos (legitimação simbólica) ---
+        "abençoado", "abençoada", "graças a deus", "fé no futuro", "com fé",
+        "milagre", "vitória divina", "deus no comando", "mão de deus", "gratidão",
+        "esperança renovada", "luz", "renascer", "recomeço", "nova era", "novo tempo",
+
+        # --- Expressões de enquadramento político positivo ---
+        "vitória do povo", "vitória da democracia", "mudança histórica", "um novo tempo",
+        "um governo de todos", "para o povo", "pelo bem do brasil", "resgata a confiança",
+        "recupera a credibilidade", "restaura a esperança", "une o país", "reergue o brasil",
+        "marca um novo começo", "gesto histórico", "liderança reconhecida",
+        "governo exemplar", "vitória consolidada", "forte apoio popular",
+        "popularidade em alta", "apoio crescente", "aprovado pela maioria",
+        "melhora dos indicadores", "recorde de aprovação", "otimismo no país",
+
+        # --- Campos de afeto social positivo (Bardin: valência afetiva) ---
+        "alegria", "felicidade", "satisfação", "orgulho", "emoção", "esperança",
+        "confiança", "motivação", "gratidão", "solidariedade", "alívio", "reconciliação",
+        "prosperidade", "paz", "harmonia", "consciência", "mudança para melhor",
+        "sensação de vitória", "energia positiva", "novo ciclo", "reconstrução nacional"
+    },
+    "signals": [
+        "positive_tone",
+        "celebratory_markers",
+        "admiration_words",
+        "religious_legitimation",
+        "achievement_semantics",
+        "cooperation_frames"
+    ]
+},
+
+"Negativo": {
+    "keywords": {
+        # --- Núcleo afetivo: Emoções de desaprovação (Bardin: valência negativa) ---
+        "vergonha", "tristeza", "decepção", "revolta", "indignação", "cansaço",
+        "desânimo", "raiva", "ódio", "frustração", "desespero", "desilusão",
+        "humilhação", "desconfiança", "descrença", "repulsa", "repúdio",
+        "ressentimento", "injustiça", "insatisfação", "medo", "angústia",
+        "lamentável", "lastimável", "patético", "trágico", "triste", "infeliz",
+
+        # --- Verbos de acusação, crise ou falha (Fairclough: significado acional negativo) ---
+        "criticar", "protestar", "reclamar", "denunciar", "acusar", "atacar",
+        "reprovar", "repudiar", "questionar", "duvidar", "ridicularizar",
+        "ironizar", "hostilizar", "rechaçar", "demitir", "punir", "desmentir",
+        "culpar", "responsabilizar", "expor", "ameaçar", "boicotar", "sabotar",
+        "enfraquecer", "ignorar", "omitir", "negar", "desmentir", "cancelar",
+
+        # --- Adjetivos depreciativos / deslegitimação moral (Fairclough: identificacional) ---
+        "mentiroso", "enganador", "corrupto", "desonesto", "arrogante", "covarde",
+        "incompetente", "ineficiente", "irresponsável", "ineficaz", "abusivo",
+        "autoritário", "mentiroso", "ganancioso", "criminoso", "mal-intencionado",
+        "falso", "hipócrita", "imoral", "traidor", "ridículo", "inepto", "vazio",
+        "mesquinho", "fraco", "desprezível", "desqualificado", "mentecapto",
+
+        # --- Substantivos e frames de crise, caos e descrédito (Fairclough: representacional) ---
+        "fracasso", "falha", "erro", "crise", "colapso", "desastre", "caos",
+        "escândalo", "polêmica", "vergonha nacional", "retrocesso", "declínio",
+        "queda", "derrota", "instabilidade", "desgoverno", "corrupção", "abandono",
+        "descaso", "negligência", "má gestão", "falta de planejamento", "incompetência",
+        "ineficiência", "impunidade", "mentira", "farsa", "fraude", "golpe",
+        "manipulação", "censura", "crise política", "crise econômica",
+        "ameaça à democracia", "escândalo de corrupção", "ataque às instituições",
+
+        # --- Expressões idiomáticas e ironias jornalísticas (efeito de polidez agressiva) ---
+        "ninguém aguenta mais", "que vergonha", "que absurdo", "não dá pra acreditar",
+        "inacreditável", "vergonha alheia", "absurdo total", "situação caótica",
+        "triste realidade", "clima de tensão", "momento delicado", "dia sombrio",
+        "fracasso anunciado", "mais uma crise", "governo falhou", "erro grave",
+        "escândalo em andamento", "denúncia grave", "reação negativa", "revolta popular",
+        "pressão crescente", "queda de popularidade", "rejeição nas ruas",
+        "falta de transparência", "promessas não cumpridas", "ilusões quebradas",
+        "mentiras reveladas", "desgaste político", "crise sem precedentes",
+
+        # --- Construções de enquadramento negativo / frames de ameaça ---
+        "ameaça", "ataque", "retrocesso", "retroceder", "deterioração",
+        "paralisação", "impasse", "bloqueio", "colapso", "fragilidade",
+        "instabilidade", "declínio", "reversão", "insegurança", "insucesso",
+        "caótica", "descontrolado", "crítico", "problemático", "alarmante",
+
+        # --- Frames morais negativos (Bardin: juízo ético) ---
+        "traição", "farsa", "hipocrisia", "mentira", "enganoso", "enganar",
+        "imoral", "vergonhoso", "desonroso", "desrespeitoso", "ultrajante",
+        "abusivo", "ofensivo", "escandaloso", "piorou", "ameaçado", "corrompido"
+    },
+    "signals": [
+        "negative_tone",
+        "emotional_disapproval",
+        "moral_delegitimation",
+        "crisis_frame",
+        "ironic_disapproval"
+    ]
+},
+
+
+"Radical": {
+    "keywords": {
+        # --- Núcleo de antagonismo e polarização (Bardin: valência negativa extrema) ---
+        "inimigo", "traidor", "vendido", "canalha", "crápula", "escória", "lixo",
+        "bandido", "criminoso", "corrupto", "ladrão", "vagabundo", "parasita",
+        "escandaloso", "desgraçado", "covarde", "verme", "idiota", "imbecil",
+        "burro", "canalhas", "merda", "nojento", "repugnante", "miserável",
+        "asqueroso", "farsante", "cretino", "mentiroso", "desonesto", "monstro",
+        "antipatriota", "inimigos da nação", "traidores do povo", "canalhas do sistema",
+
+        # --- Marcadores de guerra moral / metáforas bélicas (Fairclough: acional) ---
+        "guerra", "combate", "batalha", "luta", "revolução", "insurgência", "retaliação",
+        "ataque", "invasão", "caça às bruxas", "caçar", "exterminar", "eliminar",
+        "derrubar", "destruir", "expulsar", "aniquilar", "confronto", "enfrentamento",
+        "defender a pátria", "salvar o brasil", "resistência", "contra o sistema",
+        "derrubem tudo", "derrubar o governo", "derrubar o stf", "tomar o poder",
+        "guerra cultural", "batalha espiritual", "revolta popular",
+
+        # --- Frames identitários de polarização (Fairclough: identificacional) ---
+        "comunista", "esquerdista", "petista", "antipetista",
+        "antibolsonarista", "direitista", "fascista", "nazista",
+        "extremista", "militante", "lacrador", "lacração", "hater", "esquerdalha",
+        "coxinha", "mortadela", "gado", "mito", "lulopetismo", "antipetismo",
+        "bolsonarismo", "petismo", "progressista", "globalista", "nova ordem mundial",
+        "esquerda radical", "direita radical", "revolucionário", "conservador raiz",
+
+        # --- Frames religiosos e morais de pureza (Fairclough: interdiscursividade moral) ---
+        "deus acima de todos", "família acima de tudo", "pátria amada", "povo de bem",
+        "cristão de verdade", "valores cristãos", "defensores da fé", "guerra espiritual",
+        "luz contra as trevas", "forças do mal", "batalha espiritual", "povo escolhido",
+        "salvação nacional", "redenção do brasil", "a verdade vai aparecer",
+        "a verdade será revelada", "mensagem divina", "missão patriótica",
+
+        # --- Frames conspiratórios e antipolíticos (Bardin: deslegitimação radical) ---
+        "golpe", "golpista", "sistema podre", "sistema apodrecido", "ditadura togada",
+        "supremocracia", "supremo autoritário", "tirania judicial", "stf ditador",
+        "tse corrupto", "congresso vendido", "mídia golpista", "mídia vendida",
+        "gabinete do ódio", "narrativa mentirosa", "narrativa da esquerda",
+        "narrativa da direita", "infiltrados", "poder das sombras",
+        "nova ordem mundial", "marxismo cultural", "globalistas", "foro de são paulo",
+        "lavagem cerebral", "doutrinação", "escola sem partido",
+        "sistema apodrecido", "instituições corrompidas", "estado paralelo",
+
+        # --- Frames autoritários e intervencionistas ---
+        "intervenção militar", "golpe militar", "tomada de poder", "quebra institucional",
+        "atos antidemocráticos", "patriotas", "movimento patriota", "exército nas ruas",
+        "fechar o congresso", "fechar o stf", "prisão para ministros", "punição exemplar",
+        "limpar o país", "purificar o brasil", "expurgar", "prisão imediata",
+        "pena de morte", "prisão em massa", "acabar com a corrupção", "basta de tudo",
+        "acorda brasil", "fora comunismo", "fora stf", "fora lula", "fora bolsonaro",
+        "intervenção já", "punição divina", "deus julgará",
+
+        # --- Frames patrióticos e moralizadores (mito da nação pura) ---
+        "defensor da pátria", "salvador da nação", "herói do povo", "mártir brasileiro",
+        "verdadeiro patriota", "voz do povo", "povo oprimido", "povo acordou",
+        "brasil acima de tudo", "nossa bandeira jamais será vermelha",
+        "orgulho nacional", "honra à bandeira", "salvar o brasil", "acorda brasil",
+
+        # --- Estratégias discursivas de indignação e exaltação ---
+        "ódio", "raiva", "fúria", "vingança", "vingar-se", "cancelar", "cancelamento",
+        "cancelador", "linchar", "expor", "humilhar", "destruir reputação",
+        "ameaçar", "hostilizar", "difamar", "espalhar ódio", "ataque pessoal",
+        "palavrão", "insulto", "ofender", "xingar", "ameaça de morte",
+
+        # --- Marcadores visuais/discursivos de intensidade ---
+        "!!!", "????", "ABSURDO!", "VERGONHA!", "TRAIDOR!", "FORA!", "MITO!",
+        "LADRÃO!", "CANALHA!", "CORRUPTO!", "TRAIDORES!", "PATRIOTAS!", "DITADURA!"
+    },
+    "signals": [
+        "hate_speech",
+        "political_extremism",
+        "conspiracy_frame",
+        "religious_legitimation",
+        "patriotic_fanaticism",
+        "verbal_aggression",
+        "polarization_trigger"
+    ]
+},
+
+    "Factual/Neutro": {
+        "keywords": {
+            "dizer", "falar", "relatar", "anunciar", "informar", "explicar",
+            "declarar", "mencionar", "contar", "participar", "comparecer",
+            "encontrar", "reunir", "visitar", "responder", "fazer",
+            "aceitar", "registrar", "ocorrer", "acontecer", "realizar",
+            "mostrar", "revelar", "admitir", "avaliar", "destacar",
+            "explicar", "conversar", "apresentar", "repercutir", "assinar",
+            "sancionar", "promulgar", "ratificar",
+            "executar", "planejar", "monitorar", "acompanhar",
+            "avaliar", "analisar", "concluir", "finalizar",
+            "iniciar", "entregar", "chegar", "partir", "entrar", "sair",
+            "seguir", "continuar", "prosseguir", "parar",
+            "existir", "permanecer", "constar", "notar", "observar",
+            "perceber", "identificar", "tratar", "decidir", "votar",
+            "criar", "lançar", "executar",
+            "investir", "aplicar", "destinar", "pagar", "receber",
+            "emitir", "transportar", "viajar", "usar", "estudar",
+            "ensinar", "formar", "treinar", "atuar", "agir",
+            "comparar", "conferir", "acompanhar"
+        },
+        "signals": ["neutral_verbs", "low_emotional_markers"]
+    }
+}
+
+RADICAL_INSULTS = { "idiota","imbecil","burro","otario","otário","canalha","merda","viado","puta","vagabundo","corrupto","traidor","incompetente" }
+RADICAL_POLITICAL = {"bolsonarista","lulista","petista","pt","pl","psol","psdb"}
+news_like_re = re.compile(r'\bsegundo\b|\b(de acordo com)\b|\bfonte:?\b', flags=re.I)
+
+
+# ====================== Leitura do arquivo ======================
+if not os.path.exists(INPUT_PATH):
+    raise FileNotFoundError(f"Arquivo de entrada não encontrado: {INPUT_PATH}")
+
+logging.info("Lendo arquivo de entrada...")
+df = pd.read_excel(INPUT_PATH)
+if TEXT_COLUMN not in df.columns:
+    raise KeyError(f"Coluna '{TEXT_COLUMN}' não encontrada no arquivo. Colunas disponíveis: {df.columns.tolist()}")
+
+total_rows = len(df)
+logging.info(f"Total de linhas carregadas: {total_rows}")
+
+df['tokens_proc'] = [[] for _ in range(total_rows)]
+df['verbos_extraidos'] = [[] for _ in range(total_rows)]
+df['Categorias_Esteticas'] = [[] for _ in range(total_rows)]
+df['evidence'] = [[] for _ in range(total_rows)]
+
+def get_normalized(i):
+    return normalize(df.at[i, TEXT_COLUMN])
+
+# ============== Extração híbrida (corrigida) ==============
+def extrair_tokens_verbos_hibrido_batch(texts, nlp_model=None, stanza_model=None):
+    """
+    Versão segura: processa cada texto individualmente com Stanza (se disponível) para garantir o mapeamento correto,
+    e complementa com spaCy quando disponível.
+    Retorna listas: tokens_por_texto, verbos_por_texto
+    """
+    all_tokens = []
+    all_verbos = []
+
+    for text in texts:
+        tokens = []
+        verbos = []
+
+        # Stanza por texto (garante alinhamento)
+        if stanza_model is not None:
+            try:
+                sdoc = stanza_model(text)
+                for sent in sdoc.sentences:
+                    for w in sent.words:
+                        tok_lower = (w.text or "").lower()
+                        lemma_lower = (w.lemma or w.text or "").lower()
+                        if tok_lower and tok_lower not in tokens:
+                            tokens.append(tok_lower)
+                        if w.upos in {"VERB", "AUX"} and lemma_lower and lemma_lower not in verbos:
+                            verbos.append(lemma_lower)
+            except Exception as e:
+                logging.warning(f"Erro Stanza por texto: {e}")
+
+        # spaCy complemento
+        if nlp_model is not None:
+            try:
+                doc = nlp_model(text)
+                for t in doc:
+                    if getattr(t, "is_alpha", False) and t.text:
+                        lower = t.text.lower()
+                        if lower not in tokens:
+                            tokens.append(lower)
+                    if getattr(t, "pos_", "") in {"VERB", "AUX"} and getattr(t, "lemma_", None):
+                        lemma_l = t.lemma_.lower()
+                        if lemma_l not in verbos:
+                            verbos.append(lemma_l)
+            except Exception as e:
+                logging.warning(f"Erro spaCy por texto: {e}")
+
+        if not verbos:
+            verbos = ["nenhum"]
+
+        all_tokens.append(tokens)
+        all_verbos.append(verbos)
+
+        # pequena limpeza por item (ajuda memória em batches grandes)
+        gc.collect()
+
+    return all_tokens, all_verbos
+
+# ============== Função de classificação (melhor comparações) ==============
+
+def classify_title(original_text, normalized_text, tokens, verbos):
+    """
+    Versão reforçada com:
+    - cálculo de escores por categoria;
+    - resolução de conflitos por score e por prioridade;
+    - exclusividade absoluta (uma categoria final por título);
+    - Factual/Neutro tem prioridade mais baixa.
+    """
+    evidence = []
+    # sinais básicos
+    has_url = contains_url(original_text)
+    has_quotes = contains_quotes(original_text)
+    has_hashtag_sarcasm = contains_hashtag_sarcasm(original_text)
+    has_meme = contains_meme_markers(original_text)
+    up_density = uppercase_density(original_text)
+    exclams = exclamation_count(original_text)
+
+    tokens_norm = set(normalize(t) for t in (tokens or []))
+    verbos_norm = set(normalize(v) for v in (verbos or []))
+
+    # inicializa escores
+    scores = {
+        "Radical": 0.0,
+        "Positivo": 0.0,
+        "Negativo": 0.0,
+        "Humorístico/Irônico": 0.0,
+        "Avaliativo/Comparativo": 0.0,
+        "Jornalístico": 0.0,
+        "Factual/Neutro": 0.0
+    }
+
+    # --- RADICAL (forte sinal negativo/agressivo) ---
+    # insultos explícitos via lista e tokens
+    if any(normalize(w) in tokens_norm for w in RADICAL_INSULTS):
+        scores["Radical"] += 1.5
+        evidence.append("Radical: insulto explícito em token")
+    # palavras-chave radical (substring no texto normalizado)
+    r_keywords = CATEGORIES_KEYWORDS["Radical"]["keywords"]
+    if any(normalize(kw) in normalized_text for kw in r_keywords):
+        scores["Radical"] += 1.0
+        evidence.append("Radical: palavra-chave radical detectada")
+    # intensidade gráfica
+    if up_density > 0.25:
+        scores["Radical"] += 0.5
+        evidence.append(f"Radical: alta densidade de MAIÚSCULAS ({up_density:.2f})")
+    if exclams >= 2:
+        scores["Radical"] += 0.6
+        evidence.append(f"Radical: {exclams} exclamações")
+
+    # --- POSITIVO / NEGATIVO (valência afetiva) ---
+    p_keywords = CATEGORIES_KEYWORDS["Positivo"]["keywords"]
+    n_keywords = CATEGORIES_KEYWORDS["Negativo"]["keywords"]
+    if any(normalize(kw) in normalized_text for kw in p_keywords) or any(kw in tokens_norm for kw in (normalize(w) for w in p_keywords)):
+        scores["Positivo"] += 1.0
+        evidence.append("Positivo: termo positivo detectado")
+    if any(normalize(kw) in normalized_text for kw in n_keywords) or any(kw in tokens_norm for kw in (normalize(w) for w in n_keywords)):
+        scores["Negativo"] += 1.0
+        evidence.append("Negativo: termo negativo detectado")
+
+    # heurísticas implícitas (fortalecem Positivo/Negativo)
+    implicit_pos = re.search(r"(recorde de alta|melhor resultado|avanço|recupera|otimismo|crescimento|aumento de)", normalized_text)
+    implicit_neg = re.search(r"(recorde de baixa|pior resultado|queda|crise|colapso|desaceleração|desemprego)", normalized_text)
+    if implicit_pos:
+        scores["Positivo"] += 0.8
+        evidence.append("Positivo: heurística de tendência positiva")
+    if implicit_neg:
+        scores["Negativo"] += 0.8
+        evidence.append("Negativo: heurística de tendência negativa")
+
+    # intensificadores + verbos estativos sugerindo avaliação
+    intensifiers = bool(re.search(r"\b(tão|nunca|muito|demais|cada vez)\b", normalized_text))
+    if intensifiers and any(v in verbos_norm for v in {"ser","estar","ficar","parecer","continuar"}):
+        # reforça avaliação (pode virar Positivo/Negativo dependendo de palavras)
+        scores["Avaliativo/Comparativo"] += 0.7
+        evidence.append("Avaliativo/Comparativo: intensificador + verbo estativo")
+
+    # --- HUMOR/IRONIA ---
+    h_keywords = CATEGORIES_KEYWORDS["Humorístico/Irônico"]["keywords"]
+    if has_meme and len(original_text) < 140:
+        scores["Humorístico/Irônico"] += 1.0
+        evidence.append("Humorístico/Irônico: marcador de meme/emoji curto")
+    if has_hashtag_sarcasm:
+        scores["Humorístico/Irônico"] += 1.0
+        evidence.append("Humorístico/Irônico: hashtag de sarcasmo")
+    if any(normalize(kw) in normalized_text for kw in h_keywords) or any(kw in tokens_norm for kw in (normalize(w) for w in h_keywords)):
+        scores["Humorístico/Irônico"] += 0.8
+        evidence.append("Humorístico/Irônico: palavra-chave de sátira")
+
+    # --- AVALIATIVO/COMPARATIVO ---
+    aval_keywords = CATEGORIES_KEYWORDS["Avaliativo/Comparativo"]["keywords"]
+    if any(normalize(kw) in normalized_text for kw in aval_keywords) or any(kw in tokens_norm for kw in (normalize(w) for w in aval_keywords)):
+        scores["Avaliativo/Comparativo"] += 1.0
+        evidence.append("Avaliativo/Comparativo: termo avaliativo/comparativo detectado")
+
+    # --- JORNALÍSTICO (evidência objetiva: aspas, url, 'segundo', 'fonte') ---
+    news_score = 0.0
+    if has_quotes:
+        news_score += 1.0
+        evidence.append("Jornalístico: aspas detectadas")
+    if has_url:
+        news_score += 1.0
+        evidence.append("Jornalístico: URL/Link presente")
+    if news_like_re.search(original_text or ""):
+        news_score += 1.0
+        evidence.append("Jornalístico: padrão 'segundo/fonte' detectado")
+    j_keywords = CATEGORIES_KEYWORDS["Jornalístico"]["keywords"]
+    if any(normalize(kw) in normalized_text for kw in j_keywords):
+        news_score += 0.8
+        evidence.append("Jornalístico: palavra-chave jornalística presente")
+    scores["Jornalístico"] += news_score
+
+    # --- FACTUAL/NEUTRO (atribuir apenas se houver evidência factual clara OU se não houver sinais afetivos) ---
+    # Critérios fortes: verbos factuais + ausência de marcadores afetivos / humorísticos / radical / avaliativos
+    f_keywords = CATEGORIES_KEYWORDS["Factual/Neutro"]["keywords"]
+    factual_match = any(normalize(kw) in normalized_text for kw in f_keywords) or any(kw in tokens_norm for kw in (normalize(w) for w in f_keywords))
+    neutral_like = (not has_meme and not has_hashtag_sarcasm and up_density < 0.15 and exclams <= 1)
+    # Só adiciona peso factual se houver match explícito ou se for texto neutro sem qualquer outra força
+    if factual_match:
+        scores["Factual/Neutro"] += 1.0
+        evidence.append("Factual/Neutro: verbo/palavra factual detectada")
+    # se nenhuma outra categoria teve score > 0.0 e neutral_like -> factual por default (peso baixo)
+    other_nonfactual_score = sum(v for k,v in scores.items() if k != "Factual/Neutro")
+    if other_nonfactual_score == 0.0 and neutral_like:
+        scores["Factual/Neutro"] += 0.6
+        evidence.append("Factual/Neutro: fallback neutro (sem marcadores afetivos)")
+
+    # --- Normalizar/decisão final por prioridade e exclusividade ---
+    # Prioridade (alta -> baixa): Radical, Negativo, Positivo, Humorístico/Irônico,
+    # Avaliativo/Comparativo, Jornalístico, Factual/Neutro
+    priority = ["Negativo", "Positivo", "Humorístico/Irônico", "Radical", "Avaliativo/Comparativo", "Jornalístico", "Factual/Neutro"]
+
+    # escolha candidata: maior score; se empate, desempata por ordem de 'priority'
+    max_score = max(scores.values())
+    # se max_score == 0 -> marcar 'Outro'
+    if max_score == 0.0:
+        return (["Outro"], ["Nenhum indicador claro; rotulado como Outro"])
+
+    # candidates with top score
+    candidates = [k for k,v in scores.items() if v == max_score and v > 0.0]
+
+    # desempate por prioridade
+    chosen = None
+    for cat in priority:
+        if cat in candidates:
+            chosen = cat
+            break
+
+    # final category (exclusiva)
+    final_cats = [chosen] if chosen else ["Outro"]
+    # retorne evidence final sem duplicatas
+    evidence = list(dict.fromkeys(evidence))
+    return final_cats, evidence
+
+
+df_outros = df[df['Categorias_Esteticas'].apply(lambda x: 'Outros' in x)]
+df_outros[['Texto Limpo', 'evidence']].to_excel("outros_para_analise.xlsx", index=False)
+
+
+# ====================== Loop principal (com batches) ======================
+logging.info("Iniciando pré-processamento e classificação usando Stanza e spaCy...")
+
+start_time = time.time()
+
+rows = df[TEXT_COLUMN].astype(str).tolist()
+total = len(rows)
+
+tokens_list = []
+verbos_list = []
+cats_list = []
+evidence_list = []
+
+for start in range(0, total, BATCH_SIZE):
+    end = min(start + BATCH_SIZE, total)
+    batch_texts = rows[start:end]
+
+    # Extrair tokens/verbos por texto (garante mapeamento correto)
+    batch_tokens, batch_verbos = extrair_tokens_verbos_hibrido_batch(
+        batch_texts, nlp_model=nlp, stanza_model=stanza_nlp
+    )
+
+    # Classificar cada item do batch
+    for i, orig_text in enumerate(batch_texts):
+        tokens = batch_tokens[i]
+        verbos = batch_verbos[i] or ["nenhum"]
+        norm_text = normalize(orig_text)
+
+        cats, ev = classify_title(orig_text, norm_text, tokens, verbos)
+
+        tokens_list.append(tokens)
+        verbos_list.append(verbos)
+        cats_list.append(cats)
+        evidence_list.append(ev)
+
+    # limpeza de memória por batch
+    gc.collect()
+    if torch is not None:
+        try:
+            if hasattr(torch, 'cuda'):
+                torch.cuda.empty_cache()
+        except Exception as e:
+            logging.debug(f"Não foi possível limpar cache CUDA: {e}")
+
+    logging.info(f"Processadas {end}/{total} ({(end/total)*100:.1f}%)")
+
+elapsed = time.time() - start_time
+logging.info(f"Pré-processamento e classificação concluídos em {elapsed:.1f}s")
+
+# --- Gravação nos DataFrames ---
+df['tokens_proc'] = tokens_list
+df['verbos_extraidos'] = verbos_list
+df['Categorias_Esteticas'] = cats_list
+df['evidence'] = evidence_list
+
+# ====================== Verificações rápidas ======================
+outro_count = sum('Outro' in cats for cats in df['Categorias_Esteticas'])
+nenhum_verbos = sum((v == ["nenhum"]) or (len(v) == 0) for v in df['verbos_extraidos'])
+logging.info(f"{outro_count} títulos classificados como 'Outro' (sem indicador claro)")
+logging.info(f"{nenhum_verbos} títulos sem verbo extraído")
+
+if outro_count > 0:
+    exemplos_outro = df[df['Categorias_Esteticas'].apply(lambda x: 'Outro' in x)].sample(min(10, outro_count), random_state=42)
+    logging.info("Exemplos (amostra) rotulados como 'Outro':")
+    for idx, row in exemplos_outro.iterrows():
+        logging.info(f" - [{idx}] {row[TEXT_COLUMN]} -> evidence: {row['evidence']}")
+
+# ====================== Co-ocorrência / Frequências ======================
+def get_pairs(affects):
+    affects = sorted([a for a in affects if a not in ('Outro',)])
+    return list(combinations(affects, 2))
+
+pairs_series = df['Categorias_Esteticas'].apply(get_pairs)
+cooc = Counter([pair for pairs in pairs_series for pair in pairs])
+df_cooc = pd.DataFrame(
+    [(a,b,c) for (a,b),c in cooc.items()],
+    columns=['Categoria1','Categoria2','Frequencia']
+).sort_values('Frequencia', ascending=False)
+
+freq_geral = df.explode('Categorias_Esteticas')['Categorias_Esteticas'].value_counts().reset_index()
+freq_geral.columns = ['Categoria','Total']
+
+todos_verbos = [v for lista in df['verbos_extraidos'] for v in lista if v and v != "nenhum"]
+freq_verbos = pd.DataFrame(Counter(todos_verbos).most_common(200), columns=['Verbo','Frequencia'])
+
+if POLITICIAN_COL in df.columns:
+    freq_por_politico = df.explode('Categorias_Esteticas').groupby([POLITICIAN_COL, 'Categorias_Esteticas']).size().reset_index(name='Frequencia')
+else:
+    freq_por_politico = pd.DataFrame()
+
+# ====================== Exportação ======================
+
+with pd.ExcelWriter(OUTPUT_PATH, engine='xlsxwriter') as writer:
+     df['texto_normalizado_temp'] = df[TEXT_COLUMN].astype(str).apply(normalize)
+     cols_to_export = [TEXT_COLUMN, 'texto_normalizado_temp', 'tokens_proc', 'verbos_extraidos', 'Categorias_Esteticas', 'evidence']
+     if POLITICIAN_COL in df.columns:
+         cols_to_export.insert(0, POLITICIAN_COL)
+
+     cols_to_export = [c for c in cols_to_export if c in df.columns]
+     to_write = df[cols_to_export]
+     to_write.to_excel(writer, sheet_name='Afetos_Esteticos', index=False)
+     freq_geral.to_excel(writer, sheet_name='Distribuicao_Geral', index=False)
+     freq_verbos.to_excel(writer, sheet_name='Verbos_Frequentes', index=False)
+     if not df_cooc.empty:
+         df_cooc.to_excel(writer, sheet_name='Coocorrencia', index=False)
+     if not freq_por_politico.empty:
+         freq_por_politico.to_excel(writer, sheet_name='Por_Politico', index=False)
+
+ # remover coluna temporária após escrita
+if 'texto_normalizado_temp' in df.columns:
+     df.drop(columns=['texto_normalizado_temp'], inplace=True)
+
+logging.info("Exportação concluída.")
+
+# ====================== Sumário ======================
+logging.info("=== Sumário Rápido ===")
+logging.info(f"Total linhas: {total}")
+logging.info(f"Categorias (contagem por categoria):\n{freq_geral.to_string(index=False)}")
+if not df_cooc.empty:
+    logging.info(f"Top coocorrências:\n{df_cooc.head().to_string(index=False)}")
+
+logging.info("Script finalizado com sucesso.")
+

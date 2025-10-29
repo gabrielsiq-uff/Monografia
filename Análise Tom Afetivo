@@ -8,10 +8,6 @@ from itertools import combinations
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing
-
-
 
 # Configurar logging cedo para capturar mensagens de carregamento
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
@@ -117,6 +113,15 @@ def contains_meme_markers(text):
 
     t = text.lower()
 
+def ngrams_from_text(text, n=3):
+    toks = re.findall(r'\b[^\d\W_]+\b', text, flags=re.UNICODE)
+    toks = [t.lower() for t in toks if t.lower() not in stopwords_pt]
+    ngrams = set()
+    for k in range(1, n+1):
+        for i in range(len(toks)-k+1):
+            ngrams.add(" ".join(toks[i:i+k]))
+    return ngrams
+
     # risadas explícitas
     if re.search(r'\b(k{2,}|rs{2,}|haha+|heueh+|hueh+|kkk+)\b', t):
         return True
@@ -138,6 +143,10 @@ def contains_meme_markers(text):
         return False
 
     return False
+
+def exact_kw_match_in_text(text, kw):
+    # kw já pode ser frase; compara com word-boundaries em texto normalizado
+    return bool(re.search(r'\b' + re.escape(normalize(kw)) + r'\b', text))
 
 
 def uppercase_density(text):
@@ -164,14 +173,55 @@ def simple_tokenize_and_filter(text):
     tokens = [t.lower() for t in tokens if t.lower() not in stopwords_pt and len(t) > 1]
     return tokens
 
+import re
+
 def keyword_in_text(text, keywords_set):
+    """
+    Verifica se qualquer keyword (exata, com boundary) aparece em `text`.
+    Retorna True/False. NÃO altera scores nem usa variáveis externas.
+    """
     if not text:
         return False
     text_norm = normalize(text)
     for kw in keywords_set:
-        if normalize(kw) in text_norm:
+        kw_norm = normalize(kw)
+        # match de palavra/expression com word-boundaries
+        if re.search(r'\b' + re.escape(kw_norm) + r'\b', text_norm):
             return True
     return False
+
+
+def keyword_score_increment(tokens_norm, normalized_text, keywords_set, exact_weight=1.0, partial_weight=0.3):
+    """
+    Calcula incremento de score (float) e lista de evidências para um conjunto de keywords.
+    - tokens_norm: set/list de tokens lematizados/normalizados do texto (forneça tokens extraidos).
+    - normalized_text: texto normalizado (string).
+    - keywords_set: iterável de keywords (strings).
+    Retorna (incremento_total: float, evidences: list[str]).
+    Esta função NÃO altera variáveis externas; retorna valores para você somar em `scores[cat]`.
+    """
+    inc = 0.0
+    evidences = []
+    tokens_norm = set(tokens_norm or [])
+
+    for kw in keywords_set:
+        kw_norm = normalize(kw)
+        # correspondência exata em texto (palavra/frase) — preferível
+        if re.search(r'\b' + re.escape(kw_norm) + r'\b', normalized_text):
+            inc += exact_weight
+            evidences.append(f"kw exata: '{kw}'")
+            continue
+        # correspondência exata em tokens (tokenizado)
+        if kw_norm in tokens_norm:
+            inc += exact_weight
+            evidences.append(f"kw tokenizada: '{kw}'")
+            continue
+        # correspondência parcial entre tokens e keyword (ex.: atac <-> atacar)
+        if any(t.startswith(kw_norm) or kw_norm.startswith(t) for t in tokens_norm):
+            inc += partial_weight
+            evidences.append(f"kw parcial: '{kw}'")
+    return inc, evidences
+
 
 # ============== Categorias e sinais ==============
 CATEGORIES_KEYWORDS = {
@@ -257,9 +307,9 @@ CATEGORIES_KEYWORDS = {
     "Avaliativo/Comparativo": {
         "keywords": {
             # --- Humor e ironia --- # --- Avaliações positivas implícitas ---
-        "eficiente", "eficaz", "competente", "responsável", "transparente", "estável",
-        "coerente", "sólido", "consistente", "positivo", "favorável", "adequado",
-        "prudente", "assertivo", "exemplar", "notável", "sustentável", "relevante",
+        "eficiente", "eficaz", "competente", "responsável", "transparente", "estável","ratificar","criar","lançar","executar",
+        "coerente", "sólido", "consistente", "positivo", "favorável", "adequado","avaliar","analisar","sancionar","promulgar",
+        "prudente", "assertivo", "exemplar", "notável", "sustentável", "relevante","destacar","repecurtir","assinar",
 
         # --- Avaliações negativas implícitas ---
         "ineficiente", "ineficaz", "incompetente", "irresponsável", "instável",
@@ -483,25 +533,20 @@ CATEGORIES_KEYWORDS = {
 },
 
     "Factual/Neutro": {
-        "keywords": {
-            "dizer", "falar", "relatar", "anunciar", "informar", "explicar",
-            "declarar", "mencionar", "contar", "participar", "comparecer",
-            "encontrar", "reunir", "visitar", "responder", "fazer",
-            "aceitar", "registrar", "ocorrer", "acontecer", "realizar",
-            "mostrar", "revelar", "admitir", "avaliar", "destacar",
-            "explicar", "conversar", "apresentar", "repercutir", "assinar",
-            "sancionar", "promulgar", "ratificar",
-            "executar", "planejar", "monitorar", "acompanhar",
-            "avaliar", "analisar", "concluir", "finalizar",
-            "iniciar", "entregar", "chegar", "partir", "entrar", "sair",
-            "seguir", "continuar", "prosseguir", "parar",
-            "existir", "permanecer", "constar", "notar", "observar",
-            "perceber", "identificar", "tratar", "decidir", "votar",
-            "criar", "lançar", "executar",
-            "investir", "aplicar", "destinar", "pagar", "receber",
-            "emitir", "transportar", "viajar", "usar", "estudar",
-            "ensinar", "formar", "treinar", "atuar", "agir",
-            "comparar", "conferir", "acompanhar"
+        "keywords_strong": {
+            "informar", "anunciar", "relatar", "declarar", "registrar", "sancionar", "promulgar"
+        },
+        "keywords_weak": {
+            "dizer", "falar", "contar", "mencionar", "participar", "comparecer", "encontrar",
+            "reunir", "visitar", "responder", "fazer", "ocorrer", "acontecer",
+            "realizar", "mostrar", "revelar", "avaliar", "apresentar", "assinar",
+            "executar", "planejar", "acompanhar", "analisar", "concluir", "finalizar",
+            "iniciar", "entregar", "chegar", "partir", "entrar", "sair", "seguir", "continuar",
+            "prosseguir", "parar", "existir", "permanecer", "constar", "notar", "observar",
+            "perceber", "identificar", "tratar", "decidir", "votar", "criar", "lançar",
+            "investir", "aplicar", "destinar", "pagar", "emitir", "transportar",
+            "viajar", "usar", "estudar", "ensinar", "formar", "treinar", "atuar", "agir",
+            "conferir"
         },
         "signals": ["neutral_verbs", "low_emotional_markers"]
     }
@@ -533,73 +578,79 @@ def get_normalized(i):
     return normalize(df.at[i, TEXT_COLUMN])
 
 # ============== Extração híbrida (corrigida) ==============
+
 def extrair_tokens_verbos_hibrido_batch(texts, nlp_model=None, stanza_model=None):
-    """
-    Versão segura: processa cada texto individualmente com Stanza (se disponível) para garantir o mapeamento correto,
-    e complementa com spaCy quando disponível.
-    Retorna listas: tokens_por_texto, verbos_por_texto
-    """
-    all_tokens = []
-    all_verbos = []
+    all_tokens, all_verbos = [], []
 
     for text in texts:
-        tokens = []
-        verbos = []
+        token_set, verbo_set = set(), set()
+        txt = str(text or "")
 
-        # Stanza por texto (garante alinhamento)
+        # Stanza (lemmas/upos)
         if stanza_model is not None:
             try:
-                sdoc = stanza_model(text)
+                sdoc = stanza_model(txt)
                 for sent in sdoc.sentences:
                     for w in sent.words:
-                        tok_lower = (w.text or "").lower()
-                        lemma_lower = (w.lemma or w.text or "").lower()
-                        if tok_lower and tok_lower not in tokens:
-                            tokens.append(tok_lower)
-                        if w.upos in {"VERB", "AUX"} and lemma_lower and lemma_lower not in verbos:
-                            verbos.append(lemma_lower)
+                        tok = normalize(w.text)
+                        lemma = normalize(w.lemma or w.text)
+                        if tok and tok not in stopwords_pt and len(tok) > 1:
+                            token_set.add(tok)
+                        if lemma and w.upos in {"VERB","AUX"}:
+                            verbo_set.add(lemma)
             except Exception as e:
-                logging.warning(f"Erro Stanza por texto: {e}")
+                logging.debug(f"Stanza error: {e}")
 
-        # spaCy complemento
+        # spaCy (lemmas + dependency-based verb-object bigrams)
         if nlp_model is not None:
             try:
-                doc = nlp_model(text)
+                doc = nlp_model(txt)
                 for t in doc:
-                    if getattr(t, "is_alpha", False) and t.text:
-                        lower = t.text.lower()
-                        if lower not in tokens:
-                            tokens.append(lower)
-                    if getattr(t, "pos_", "") in {"VERB", "AUX"} and getattr(t, "lemma_", None):
-                        lemma_l = t.lemma_.lower()
-                        if lemma_l not in verbos:
-                            verbos.append(lemma_l)
+                    if getattr(t, "is_alpha", False):
+                        tok = normalize(t.text)
+                        lemma = normalize(t.lemma_)
+                        if tok and tok not in stopwords_pt and len(tok) > 1:
+                            token_set.add(tok)
+                        if t.pos_ in {"VERB","AUX"}:
+                            verbo_set.add(lemma)
+                        # capture verb-object combos (obj head)
+                        if t.pos_ == "VERB":
+                            for child in t.children:
+                                if child.dep_.endswith("obj") or child.dep_.endswith("obl"):
+                                    obj = normalize(child.text)
+                                    if obj and len(obj) > 1:
+                                        token_set.add(f"{lemma} {obj}")
+                                        verbo_set.add(lemma)
             except Exception as e:
-                logging.warning(f"Erro spaCy por texto: {e}")
+                logging.debug(f"spaCy error: {e}")
 
-        if not verbos:
-            verbos = ["nenhum"]
+        # limpeza
+        tokens = [re.sub(r'\W+', '', t) for t in token_set if len(t) > 1]
+        tokens = [t for t in tokens if t not in stopwords_pt]
+        verbos = sorted(verbo_set)
 
         all_tokens.append(tokens)
         all_verbos.append(verbos)
-
-        # pequena limpeza por item (ajuda memória em batches grandes)
         gc.collect()
 
     return all_tokens, all_verbos
+
+
 
 # ============== Função de classificação (melhor comparações) ==============
 
 def classify_title(original_text, normalized_text, tokens, verbos):
     """
-    Versão reforçada com:
-    - cálculo de escores por categoria;
-    - resolução de conflitos por score e por prioridade;
+    Classificação reforçada de títulos com:
+    - escores por categoria;
+    - resolução de conflitos por score e prioridade;
     - exclusividade absoluta (uma categoria final por título);
-    - Factual/Neutro tem prioridade mais baixa.
+    - Factual/Neutro só para casos claros;
+    - Tudo não identificado entra em 'Outros'.
     """
     evidence = []
-    # sinais básicos
+
+    # ==== Sinais básicos ====
     has_url = contains_url(original_text)
     has_quotes = contains_quotes(original_text)
     has_hashtag_sarcasm = contains_hashtag_sarcasm(original_text)
@@ -610,7 +661,7 @@ def classify_title(original_text, normalized_text, tokens, verbos):
     tokens_norm = set(normalize(t) for t in (tokens or []))
     verbos_norm = set(normalize(v) for v in (verbos or []))
 
-    # inicializa escores
+    # ==== Inicializa escores ====
     scores = {
         "Radical": 0.0,
         "Positivo": 0.0,
@@ -618,20 +669,42 @@ def classify_title(original_text, normalized_text, tokens, verbos):
         "Humorístico/Irônico": 0.0,
         "Avaliativo/Comparativo": 0.0,
         "Jornalístico": 0.0,
-        "Factual/Neutro": 0.0
+        "Factual/Neutro": 0.0,
+        "Outros": 0.0
     }
 
-    # --- RADICAL (forte sinal negativo/agressivo) ---
-    # insultos explícitos via lista e tokens
+    # ==== Dicionário base ====
+    r_kw = CATEGORIES_KEYWORDS["Radical"]["keywords"]
+    p_kw = CATEGORIES_KEYWORDS["Positivo"]["keywords"]
+    n_kw = CATEGORIES_KEYWORDS["Negativo"]["keywords"]
+    aval_kw = CATEGORIES_KEYWORDS["Avaliativo/Comparativo"]["keywords"]
+    humor_kw = CATEGORIES_KEYWORDS["Humorístico/Irônico"]["keywords"]
+    j_kw = CATEGORIES_KEYWORDS["Jornalístico"]["keywords"]
+
+    # ==== (B) Correspondência exata e parcial ====
+    for cat, kwset in {
+        "Radical": r_kw,
+        "Positivo": p_kw,
+        "Negativo": n_kw,
+        "Avaliativo/Comparativo": aval_kw,
+        "Humorístico/Irônico": humor_kw,
+        "Jornalístico": j_kw
+    }.items():
+        for kw in kwset:
+            kw_norm = normalize(kw)
+            # correspondência exata
+            if kw_norm in tokens_norm or kw_norm in normalized_text:
+                scores[cat] += 1.0
+                evidence.append(f"{cat}: palavra-chave '{kw}' encontrada")
+            # correspondência parcial (detecta variações: atacar ↔ ataca ↔ ataque)
+            elif any(t.startswith(kw_norm) or kw_norm.startswith(t) for t in tokens_norm):
+                scores[cat] += 0.3
+                evidence.append(f"{cat}: correspondência parcial '{kw}'")
+
+    # ==== RADICAL ====
     if any(normalize(w) in tokens_norm for w in RADICAL_INSULTS):
         scores["Radical"] += 1.5
         evidence.append("Radical: insulto explícito em token")
-    # palavras-chave radical (substring no texto normalizado)
-    r_keywords = CATEGORIES_KEYWORDS["Radical"]["keywords"]
-    if any(normalize(kw) in normalized_text for kw in r_keywords):
-        scores["Radical"] += 1.0
-        evidence.append("Radical: palavra-chave radical detectada")
-    # intensidade gráfica
     if up_density > 0.25:
         scores["Radical"] += 0.5
         evidence.append(f"Radical: alta densidade de MAIÚSCULAS ({up_density:.2f})")
@@ -639,52 +712,15 @@ def classify_title(original_text, normalized_text, tokens, verbos):
         scores["Radical"] += 0.6
         evidence.append(f"Radical: {exclams} exclamações")
 
-    # --- POSITIVO / NEGATIVO (valência afetiva) ---
-    p_keywords = CATEGORIES_KEYWORDS["Positivo"]["keywords"]
-    n_keywords = CATEGORIES_KEYWORDS["Negativo"]["keywords"]
-    if any(normalize(kw) in normalized_text for kw in p_keywords) or any(kw in tokens_norm for kw in (normalize(w) for w in p_keywords)):
-        scores["Positivo"] += 1.0
-        evidence.append("Positivo: termo positivo detectado")
-    if any(normalize(kw) in normalized_text for kw in n_keywords) or any(kw in tokens_norm for kw in (normalize(w) for w in n_keywords)):
-        scores["Negativo"] += 1.0
-        evidence.append("Negativo: termo negativo detectado")
-
-    # heurísticas implícitas (fortalecem Positivo/Negativo)
-    implicit_pos = re.search(r"(recorde de alta|melhor resultado|avanço|recupera|otimismo|crescimento|aumento de)", normalized_text)
-    implicit_neg = re.search(r"(recorde de baixa|pior resultado|queda|crise|colapso|desaceleração|desemprego)", normalized_text)
-    if implicit_pos:
-        scores["Positivo"] += 0.8
-        evidence.append("Positivo: heurística de tendência positiva")
-    if implicit_neg:
-        scores["Negativo"] += 0.8
-        evidence.append("Negativo: heurística de tendência negativa")
-
-    # intensificadores + verbos estativos sugerindo avaliação
-    intensifiers = bool(re.search(r"\b(tão|nunca|muito|demais|cada vez)\b", normalized_text))
-    if intensifiers and any(v in verbos_norm for v in {"ser","estar","ficar","parecer","continuar"}):
-        # reforça avaliação (pode virar Positivo/Negativo dependendo de palavras)
-        scores["Avaliativo/Comparativo"] += 0.7
-        evidence.append("Avaliativo/Comparativo: intensificador + verbo estativo")
-
-    # --- HUMOR/IRONIA ---
-    h_keywords = CATEGORIES_KEYWORDS["Humorístico/Irônico"]["keywords"]
+    # ==== HUMOR/IRONIA ====
     if has_meme and len(original_text) < 140:
         scores["Humorístico/Irônico"] += 1.0
         evidence.append("Humorístico/Irônico: marcador de meme/emoji curto")
     if has_hashtag_sarcasm:
         scores["Humorístico/Irônico"] += 1.0
         evidence.append("Humorístico/Irônico: hashtag de sarcasmo")
-    if any(normalize(kw) in normalized_text for kw in h_keywords) or any(kw in tokens_norm for kw in (normalize(w) for w in h_keywords)):
-        scores["Humorístico/Irônico"] += 0.8
-        evidence.append("Humorístico/Irônico: palavra-chave de sátira")
 
-    # --- AVALIATIVO/COMPARATIVO ---
-    aval_keywords = CATEGORIES_KEYWORDS["Avaliativo/Comparativo"]["keywords"]
-    if any(normalize(kw) in normalized_text for kw in aval_keywords) or any(kw in tokens_norm for kw in (normalize(w) for w in aval_keywords)):
-        scores["Avaliativo/Comparativo"] += 1.0
-        evidence.append("Avaliativo/Comparativo: termo avaliativo/comparativo detectado")
-
-    # --- JORNALÍSTICO (evidência objetiva: aspas, url, 'segundo', 'fonte') ---
+    # ==== JORNALÍSTICO ====
     news_score = 0.0
     if has_quotes:
         news_score += 1.0
@@ -695,57 +731,88 @@ def classify_title(original_text, normalized_text, tokens, verbos):
     if news_like_re.search(original_text or ""):
         news_score += 1.0
         evidence.append("Jornalístico: padrão 'segundo/fonte' detectado")
-    j_keywords = CATEGORIES_KEYWORDS["Jornalístico"]["keywords"]
-    if any(normalize(kw) in normalized_text for kw in j_keywords):
-        news_score += 0.8
-        evidence.append("Jornalístico: palavra-chave jornalística presente")
     scores["Jornalístico"] += news_score
 
-    # --- FACTUAL/NEUTRO (atribuir apenas se houver evidência factual clara OU se não houver sinais afetivos) ---
-    # Critérios fortes: verbos factuais + ausência de marcadores afetivos / humorísticos / radical / avaliativos
-    f_keywords = CATEGORIES_KEYWORDS["Factual/Neutro"]["keywords"]
-    factual_match = any(normalize(kw) in normalized_text for kw in f_keywords) or any(kw in tokens_norm for kw in (normalize(w) for w in f_keywords))
-    neutral_like = (not has_meme and not has_hashtag_sarcasm and up_density < 0.15 and exclams <= 1)
-    # Só adiciona peso factual se houver match explícito ou se for texto neutro sem qualquer outra força
-    if factual_match:
-        scores["Factual/Neutro"] += 1.0
-        evidence.append("Factual/Neutro: verbo/palavra factual detectada")
-    # se nenhuma outra categoria teve score > 0.0 e neutral_like -> factual por default (peso baixo)
-    other_nonfactual_score = sum(v for k,v in scores.items() if k != "Factual/Neutro")
-    if other_nonfactual_score == 0.0 and neutral_like:
-        scores["Factual/Neutro"] += 0.6
-        evidence.append("Factual/Neutro: fallback neutro (sem marcadores afetivos)")
+    # ==== POSITIVO / NEGATIVO ====
+    implicit_pos = re.search(r"(recorde de alta|melhor resultado|avanço|recupera|otimismo|crescimento|aumento de)", normalized_text)
+    implicit_neg = re.search(r"(recorde de baixa|pior resultado|queda|crise|colapso|desaceleração|desemprego)", normalized_text)
+    if implicit_pos:
+        scores["Positivo"] += 0.8
+        evidence.append("Positivo: heurística de tendência positiva")
+    if implicit_neg:
+        scores["Negativo"] += 0.8
+        evidence.append("Negativo: heurística de tendência negativa")
 
-    # --- Normalizar/decisão final por prioridade e exclusividade ---
-    # Prioridade (alta -> baixa): Radical, Negativo, Positivo, Humorístico/Irônico,
-    # Avaliativo/Comparativo, Jornalístico, Factual/Neutro
-    priority = ["Negativo", "Positivo", "Humorístico/Irônico", "Radical", "Avaliativo/Comparativo", "Jornalístico", "Factual/Neutro"]
+    # --- Verbos críticos adicionais (reforço Negativo) ---
+    neg_verbos_extra = {
+     "condenar", "criticar", "atacar", "acusar", "denunciar", "rejeitar",
+    "contestar", "recusar", "culpar", "ironizar", "hostilizar",
+    "protestar", "repudiar", "enfrentar", "confrontar", "acusar",
+    "questionar", "rebater", "desmentir", "revidar", "desafiar",
+    "demitir", "abandonar", "romper", "renunciar", "afastar",
+    # variações políticas e de conflito
+    "acirrar", "ameaçar", "pressionar", "acusado", "demitido", "repreender",
+    "investigar", "criticado", "acusou", "desmentido", "enfrentado",
+    "acusando", "acusam", "acusações"
+}
 
-    # escolha candidata: maior score; se empate, desempata por ordem de 'priority'
+    if any(v in verbos_norm for v in neg_verbos_extra):
+        scores["Negativo"] += 0.8
+        evidence.append("Negativo: verbo crítico identificado (reforço)")
+
+
+    # ==== AVALIATIVO/COMPARATIVO ====
+    intensifiers = bool(re.search(r"\b(tão|nunca|muito|demais|cada vez)\b", normalized_text))
+    if intensifiers and any(v in verbos_norm for v in {"ser","estar","ficar","parecer","continuar"}):
+        scores["Avaliativo/Comparativo"] += 0.7
+        evidence.append("Avaliativo/Comparativo: intensificador + verbo estativo")
+
+    # ----- Factual/Neutro refinado e mais restritivo -----
+    neutral_verbs = {"ser","estar","dizer","afirmar","informar","relatar","declarar","anunciar"}
+    affective_terms = {
+        "crise","apoio","ódio","ataque","tensão","vitória","derrota","acusação","escândalo",
+        "polêmica","denúncia","protesto","suspeita","corrupção","investigação"
+}
+    # sinais afetivos já detectados (tokens ou evidence)
+    has_affective_tokens = any(t in tokens_norm for t in affective_terms)
+    has_neutral_verb = any(v in verbos_norm for v in neutral_verbs)
+    has_polarity_score = (scores["Negativo"] > 0.0) or (scores["Positivo"] > 0.0) or (scores["Radical"] > 0.0)
+
+    # condição restrita: exige verbo neutro OU estrutura jornalística forte (news_score > 0.5)
+    # e NÃO ter sinais afetivos / verbos críticos
+    if not has_polarity_score and (has_neutral_verb or scores["Jornalístico"] > 0.6) and not has_affective_tokens:
+        scores["Factual/Neutro"] += 0.5
+        evidence.append("Factual/Neutro: verbo neutro/estrutura jornalística (condição restritiva satisfeita)")
+    else:
+        # reduzir tendência a marcar factual automaticamente
+        scores["Factual/Neutro"] = max(0.0, scores["Factual/Neutro"] - 0.3)
+
+
+    # ==== OUTROS (fallback) ====
     max_score = max(scores.values())
-    # se max_score == 0 -> marcar 'Outro'
-    if max_score == 0.0:
-        return (["Outro"], ["Nenhum indicador claro; rotulado como Outro"])
+    if max_score < 0.35:
+        scores["Outros"] = 1.0
+        evidence.append("Outros: pontuação máxima abaixo do limiar (0.35)")
 
-    # candidates with top score
-    candidates = [k for k,v in scores.items() if v == max_score and v > 0.0]
+    # ==== Decisão final ====
+    priority = [
+        "Radical","Negativo","Positivo","Humorístico/Irônico",
+        "Avaliativo/Comparativo","Jornalístico","Factual/Neutro","Outros"
+    ]
+    max_score = max(scores.values())
+    candidates = [k for k, v in scores.items() if v == max_score and v > 0.0]
 
-    # desempate por prioridade
     chosen = None
     for cat in priority:
         if cat in candidates:
             chosen = cat
             break
 
-    # final category (exclusiva)
-    final_cats = [chosen] if chosen else ["Outro"]
-    # retorne evidence final sem duplicatas
+    final_cats = [chosen] if chosen else ["Outros"]
     evidence = list(dict.fromkeys(evidence))
     return final_cats, evidence
 
 
-df_outros = df[df['Categorias_Esteticas'].apply(lambda x: 'Outros' in x)]
-df_outros[['Texto Limpo', 'evidence']].to_excel("outros_para_analise.xlsx", index=False)
 
 
 # ====================== Loop principal (com batches) ======================
@@ -804,16 +871,19 @@ df['Categorias_Esteticas'] = cats_list
 df['evidence'] = evidence_list
 
 # ====================== Verificações rápidas ======================
-outro_count = sum('Outro' in cats for cats in df['Categorias_Esteticas'])
+# corrigir compatibilidade de rótulos: usar 'Outros' consistentemente
+outro_label = 'Outros'
+outro_count = sum(outro_label in cats for cats in df['Categorias_Esteticas'])
 nenhum_verbos = sum((v == ["nenhum"]) or (len(v) == 0) for v in df['verbos_extraidos'])
-logging.info(f"{outro_count} títulos classificados como 'Outro' (sem indicador claro)")
+logging.info(f"{outro_count} títulos classificados como '{outro_label}' (sem indicador claro)")
 logging.info(f"{nenhum_verbos} títulos sem verbo extraído")
 
 if outro_count > 0:
-    exemplos_outro = df[df['Categorias_Esteticas'].apply(lambda x: 'Outro' in x)].sample(min(10, outro_count), random_state=42)
-    logging.info("Exemplos (amostra) rotulados como 'Outro':")
+    exemplos_outro = df[df['Categorias_Esteticas'].apply(lambda x: outro_label in x)].sample(min(10, outro_count), random_state=42)
+    logging.info("Exemplos (amostra) rotulados como 'Outros':")
     for idx, row in exemplos_outro.iterrows():
         logging.info(f" - [{idx}] {row[TEXT_COLUMN]} -> evidence: {row['evidence']}")
+
 
 # ====================== Co-ocorrência / Frequências ======================
 def get_pairs(affects):
@@ -861,6 +931,12 @@ if 'texto_normalizado_temp' in df.columns:
      df.drop(columns=['texto_normalizado_temp'], inplace=True)
 
 logging.info("Exportação concluída.")
+
+# salvar amostra de 'Outros' para revisão manual
+sample_outros = df[df['Categorias_Esteticas'].apply(lambda x: 'Outros' in x)].sample(min(200, outro_count), random_state=42)
+sample_outros.to_csv('amostra_outros_para_revisao.csv', index=False)
+logging.info("Amostra de 'Outros' salva para revisão manual: amostra_outros_para_revisao.csv")
+
 
 # ====================== Sumário ======================
 logging.info("=== Sumário Rápido ===")

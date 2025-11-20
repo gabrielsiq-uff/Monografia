@@ -1,84 +1,210 @@
-#Esse código representa a etapa de coleta de dados (webscraping) da monografia. 
-
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 from datetime import datetime, timedelta
 import re
 from tqdm import tqdm
+import logging
+from requests.adapters import HTTPAdapter, Retry
 
-import logging
-import logging
+
+
+#   LOGGING
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO)
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 
-veiculos_alvo = [
-    "O Globo",
-    "Veja",
-    "Folha"]
-inicio = datetime.strptime("2022-10-01", "%Y-%m-%d")
-fim = datetime.strptime("2022-10-30", "%Y-%m-%d")
 
-# raspagem
-def coletar_noticias(termo_busca, rotulo):
-    noticias = []
-    datas = pd.date_range(start=inicio, end=fim)
+#   PARÂMETROS DE ESCOPO DA PESQUISA
+VEICULOS = ["O Globo", "Veja", "Folha"]
+JANELAS = {
+    "1º Turno": [
+        datetime(2022, 9, 30), 
+        datetime(2022, 10, 1),
+        datetime(2022, 10, 3),
+        datetime(2022, 10, 4)
+    ],
+    "2º Turno": [
+        datetime(2022, 10, 26),
+        datetime(2022, 10, 27),
+        datetime(2022, 10, 29),
+        datetime(2022, 10, 30)
+    ]
+}
 
-    for data in tqdm(datas, desc=f"Coletando {rotulo}", ncols=100):
-        termo_formatado = termo_busca.replace(" ", "+")
-        url = (
-            f"https://news.google.com/rss/search?q={termo_formatado}"
-            f"+after:{data.date()}+before:{(data + timedelta(days=1)).date()}"
-            f"&hl=pt-BR&gl=BR&ceid=BR:pt-419"
-        )
+POLITICOS = {
+    "Bolsonaro": "Jair Bolsonaro",
+    "Lula": "Lula"
+}
 
-        try:
-            response = requests.get(url, timeout=10)
-            soup = BeautifulSoup(response.content, features="xml")
-            items = soup.find_all("item")
+#   REGISTRO METODOLÓGICO (Reprodutibilidade Científica)
 
-            for item in items:
-                titulo = item.title.text
-                descricao = item.description.text
-                fonte = item.source.text.strip() if item.source else "Desconhecida"
+VERSAO_SCRIPT = "1.0.0"  
+timestamp_execucao = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                if any(veiculo.lower() in fonte.lower() for veiculo in veiculos_alvo):
-                    noticias.append({
-                        "Político": rotulo,
-                        "Título": titulo,
-                        "Resumo": descricao,
-                        "Fonte": fonte,
-                        "Data": pd.to_datetime(item.pubDate.text).date()
-                    })
+with open("metadados_coleta.txt", "w", encoding="utf-8") as f:
+    f.write("REGISTRO METODOLÓGICO DA COLETA\n")
+    f.write("---------------------------------------\n")
+    f.write(f"Timestamp da execução: {timestamp_execucao}\n")
+    f.write(f"Versão do script: {VERSAO_SCRIPT}\n\n")
 
-        except Exception:
-             print(f"Erro ao coletar {data.date()}:")
-        continue
+    f.write("Termos buscados:\n")
+    for rotulo, nome in POLITICOS.items():
+        f.write(f"  - {rotulo}: {nome}\n")
+    f.write("\n")
 
-    return noticias
+    f.write("Veículos incluídos:\n")
+    for v in VEICULOS:
+        f.write(f"  - {v}\n")
+    f.write("\n")
 
-
-print("Coletando notícias sobre Bolsonaro")
-not_bolsonaro = coletar_noticias("Jair Bolsonaro", "Bolsonaro")
-print("Coletando notícias sobre Lula")
-not_lula = coletar_noticias("Lula", "Lula")
-df = pd.DataFrame(not_bolsonaro + not_lula)
-
-
-def limpar_texto(texto):
-    texto = BeautifulSoup(texto, "html.parser").text
-    texto = re.sub(r"<[^>]+>", "", texto)
-    texto = re.sub(r"http\S+", "", texto)
-    texto = re.sub(r"[^\w\s]", "", texto)
-    return texto.lower().strip()
+    f.write("Janelas temporais:\n")
+    for turno, datas in JANELAS.items():
+        f.write(f"  {turno}:\n")
+        for d in datas:
+            f.write(f"    - {d.strftime('%Y-%m-%d')}\n")
+        f.write("\n")
+    
+    f.write("Observações:\n")
+    f.write("  * Coleta realizada via RSS do Google News.\n")
+    f.write("  * Apenas veículos oficiais considerados.\n")
+    f.write("  * Fonte e método registrados.\n")
 
 
-por_fonte = df.groupby(["Fonte", "Político"]).size().unstack(fill_value=0).reset_index()
+#   SESSÃO HTTP COM RETRY
+session = requests.Session()
+retry = Retry(
+    total=5,
+    backoff_factor=0.5,
+    status_forcelist=[500, 502, 503, 504]
+)
+adapter = HTTPAdapter(max_retries=retry)
+session.mount("https://", adapter)
 
-with pd.ExcelWriter("analise_noticias_2022_Outubro.xlsx", engine="xlsxwriter") as writer:
+
+#   FUNÇÃO DE COLETA 
+def coletar_noticias(nome_busca, rotulo):
+    resultados = []
+    termo = nome_busca.replace(" ", "+")
+
+    for turno, datas in JANELAS.items():
+
+        for data in tqdm(datas, desc=f"Coletando {rotulo} - {turno}", ncols=100):
+
+            after = (data - timedelta(days=1)).strftime("%Y-%m-%d")
+            before = (data + timedelta(days=1)).strftime("%Y-%m-%d")
+
+            url = (
+                f"https://news.google.com/rss/search?q={termo}"
+                f"+after:{after}+before:{before}"
+                f"&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+            )
+
+            try:
+                resp = session.get(url, timeout=10)
+                #   registro bruto da resposta para auditoria
+                with open("raw_xml_dump.xml", "ab") as raw:
+                    raw.write(resp.content + b"\n\n")
+                soup = BeautifulSoup(resp.content, features="xml")
+
+                items = soup.find_all("item")
+                if not items:
+                    continue
+
+                for item in items:
+                    titulo = item.title.text if item.title else None
+                    descricao = item.description.text if item.description else None
+                    fonte = item.source.text.strip() if item.source else "Desconhecida"
+                    link = item.link.text if item.link else None
+
+                    pubdate = (
+                        pd.to_datetime(item.pubDate.text).date()
+                        if item.pubDate else None
+                    )
+
+                    #   apenas veículos oficiais
+                    if any(v.lower() in fonte.lower() for v in VEICULOS):
+                        resultados.append({
+                            "Politico": rotulo,
+                            "Turno": turno,
+                            "DataFiltro": data.date(),
+                            "DataPublicacao": pubdate,
+                            "Titulo": titulo,
+                            "Resumo": descricao,
+                            "Fonte": fonte,
+                            "URL": link
+                        })
+
+            except Exception as e:
+                logger.warning(f"Erro em {data.date()} / {rotulo}: {e}")
+
+    return resultados
+
+
+#   EXECUÇÃO
+todas = []
+for rotulo, nome in POLITICOS.items():
+    todas.extend(coletar_noticias(nome, rotulo))
+
+df = pd.DataFrame(todas)
+
+df = df[df["DataPublicacao"] == df["DataFiltro"]]
+
+#   BLACKLIST DATAFOLHA
+df = df[
+    ~(
+        df["Titulo"].str.contains("datafolha", case=False, na=False) |
+        df["Resumo"].str.contains("datafolha", case=False, na=False) |
+        df["Fonte"].str.contains("datafolha", case=False, na=False)
+    )
+]
+
+
+#   REMOÇÃO DUPLICATAS
+df_before = len(df)
+df = df.drop_duplicates(subset=["Titulo", "Fonte", "DataPublicacao"], keep="first")
+df_after = len(df)
+logger.info(f"Removidas {df_before - df_after} duplicatas.")
+
+
+#   LIMPEZA DE TEXTO
+def limpar_texto(t):
+    if pd.isna(t):
+        return ""
+    t = BeautifulSoup(t, "html.parser").text
+    t = re.sub(r"http\S+", "", t)
+    t = re.sub(r"[^\w\s]", " ", t)
+    return re.sub(r"\s+", " ", t).lower().strip()
+
+df["TituloLimpo"] = df["Titulo"].apply(limpar_texto)
+df["Tema"] = ""
+df["Tom"] = ""
+df["FormatoDiscursivo"] = ""
+
+
+#   FREQUÊNCIA
+freq = (
+    df.groupby(["Fonte", "Politico", "Turno"])
+    .size()
+    .reset_index(name="Frequencia")
+)
+
+
+#   EXPORTAÇÃO
+colunas = [
+    "Politico", "Turno", "DataFiltro", "DataPublicacao",
+    "TituloLimpo",
+    "Resumo", "Fonte", "URL",
+    "Tema", "Tom", "FormatoDiscursivo"
+]
+
+df = df[colunas]
+
+with pd.ExcelWriter("analise_noticias_2022_Turnos.xlsx") as writer:
     df.to_excel(writer, sheet_name="Noticias", index=False)
-    por_fonte.to_excel(writer, sheet_name="Frequencia por Fonte", index=False)
+    freq.to_excel(writer, sheet_name="Frequencias", index=False)
 
-print("Coleta concluída analise_noticias_2022_Outubro.xlsx")
+logger.info("Coleta concluída com rigor científico.")
